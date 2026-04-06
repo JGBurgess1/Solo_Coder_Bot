@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+
+# Install common testing and utility packages available to generated code.
+RUN pip install --no-cache-dir pytest requests
+
+WORKDIR /workspace

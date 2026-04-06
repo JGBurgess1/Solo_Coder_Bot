@@ -1,0 +1,72 @@
+version: "3.9"
+
+# Solo-Coder: agent + isolated code-execution sandbox
+#
+# Services:
+#   agent   – runs agent.py; mounts the workspace and the Docker socket
+#             so it can spin up sandbox containers on demand.
+#   sandbox – a minimal Python image used as the execution target.
+#             The agent exec's commands inside this container rather than
+#             starting a new one each time, keeping cold-start latency low.
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: solo-coder-agent
+    environment:
+      # Provide your GitHub PAT and repo at runtime:
+      #   GITHUB_PAT=ghp_xxx GITHUB_REPO=owner/repo docker compose up
+      - GITHUB_PAT=${GITHUB_PAT:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
+      - GITHUB_USER=${GITHUB_USER:-solo-coder-bot}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-bot@solo-coder.local}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:3b}
+      - TASK=${TASK:-Write a Python function that returns the nth Fibonacci number and add a pytest test for it.}
+      - WORKSPACE=/workspace
+    volumes:
+      # Agent writes generated code here; sandbox reads from the same mount.
+      - workspace_data:/workspace
+      # Docker socket so the agent can exec into the sandbox container.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    networks:
+      - solo-net
+    # Keep the agent container alive so we can attach / inspect logs.
+    restart: "no"
+
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile.sandbox
+    container_name: solo-coder-sandbox
+    volumes:
+      - workspace_data:/workspace
+    working_dir: /workspace
+    # The sandbox idles; the agent exec's commands into it.
+    command: ["tail", "-f", "/dev/null"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - solo-net
+    # Resource limits keep runaway generated code from consuming the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    restart: "no"
+
+volumes:
+  workspace_data:
+
+networks:
+  solo-net:
+    driver: bridge

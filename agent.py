@@ -26,7 +26,7 @@ from typing import Any
 
 import requests
 import trafilatura
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -78,32 +78,33 @@ def ollama_chat(messages: list[dict], temperature: float = 0.2) -> str:
 def build_system_prompt() -> str:
     return textwrap.dedent("""\
         You are Solo-Coder, an autonomous coding agent.
-        You operate in a Think-Act-Observe loop.
 
-        On each turn you MUST reply with a single JSON object — no prose, no markdown fences.
-        The object must have exactly one of these shapes:
+        STRICT OUTPUT RULE: Every reply must be ONE valid JSON object. Nothing else.
+        No explanation. No markdown. No code fences. Just the raw JSON object.
 
-        1. Search the web for documentation or examples:
-           {"action": "search", "query": "<search terms>"}
+        Available actions (pick exactly one per reply):
 
-        2. Scrape a URL and read its content:
-           {"action": "scrape", "url": "<full URL>"}
+        {"action": "write_file", "path": "solution.py", "content": "# code here"}
+        {"action": "write_file", "path": "test_solution.py", "content": "# tests here"}
+        {"action": "run_tests", "command": "pytest test_solution.py -v"}
+        {"action": "search", "query": "search terms here"}
+        {"action": "done", "summary": "one sentence describing what was built"}
 
-        3. Write a file to the workspace:
-           {"action": "write_file", "path": "<relative path>", "content": "<file content>"}
+        IMPORTANT RULES FOR write_file:
+        - The "content" value must be a valid JSON string.
+        - Escape ALL newlines as \\n (backslash-n).
+        - Escape ALL double quotes inside code as \\".
+        - Do NOT use actual line breaks inside the JSON string value.
 
-        4. Run the test suite inside the sandbox:
-           {"action": "run_tests", "command": "<shell command>"}
+        Example of a correct write_file action:
+        {"action": "write_file", "path": "solution.py", "content": "def fib(n):\\n    if n <= 1:\\n        return n\\n    return fib(n-1) + fib(n-2)\\n"}
 
-        5. Declare success (only after tests pass):
-           {"action": "done", "summary": "<one-sentence summary of what was built>"}
-
-        Rules:
-        - Always write code before running tests.
-        - Use pytest for Python tests; name test files test_*.py.
-        - Keep file paths relative (e.g. "solution.py", "test_solution.py").
-        - If tests fail, analyse the error in your next Think step and fix the code.
-        - Never emit anything outside the JSON object.
+        Workflow:
+        1. Write solution.py with the implementation.
+        2. Write test_solution.py with pytest tests.
+        3. Run the tests with run_tests.
+        4. If tests fail, fix the code and run again.
+        5. When tests pass, emit done.
     """)
 
 
@@ -236,18 +237,69 @@ def push_to_github(workspace: Path, repo: str, pat: str, user: str, email: str) 
 # Think-Act-Observe loop
 # ---------------------------------------------------------------------------
 
+def _extract_string_field(text: str, key: str) -> str | None:
+    """Pull a string value for `key` from text that may contain invalid JSON.
+
+    Handles both single-line and multi-line values by grabbing everything
+    between the opening quote after `"key":` and the next unescaped `"` that
+    is followed by either `}` or `,` (with optional whitespace).
+    """
+    # Match: "key": "...value..."  where value may span lines
+    pattern = rf'"{re.escape(key)}"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}}]'
+    m = re.search(pattern, text, re.DOTALL)
+    if m:
+        # Unescape standard JSON escape sequences
+        val = m.group(1)
+        val = val.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"').replace("\\\\", "\\")
+        return val
+    return None
+
+
 def parse_action(raw: str) -> dict[str, Any]:
-    """Extract the JSON action object from the model reply."""
-    # Strip markdown code fences if the model ignores instructions
+    """Extract the JSON action object from the model reply.
+
+    Strategy (most to least strict):
+    1. Strip markdown fences, try json.loads directly.
+    2. Find the first {...} block, try json.loads on that.
+    3. Regex-extract individual fields — handles models that embed raw
+       newlines or unescaped characters inside JSON string values.
+    """
+    # Strip markdown code fences
     cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+
+    # Attempt 1: clean parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to find the first {...} block
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        raise ValueError(f"Could not parse JSON from model reply:\n{raw}")
+        pass
+
+    # Attempt 2: find first {...} block and parse it
+    block_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if block_match:
+        try:
+            return json.loads(block_match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Attempt 3: field-by-field regex extraction for malformed JSON
+    # (common with small models that embed raw newlines in string values)
+    action_match = re.search(r'"action"\s*:\s*"([^"]+)"', cleaned)
+    if not action_match:
+        raise ValueError(f"Could not find 'action' field in model reply:\n{raw}")
+
+    result: dict[str, Any] = {"action": action_match.group(1)}
+
+    for field in ("query", "url", "path", "summary", "command"):
+        val = _extract_string_field(cleaned, field)
+        if val is not None:
+            result[field] = val
+
+    # "content" may be very long — use a greedy approach
+    content_val = _extract_string_field(cleaned, "content")
+    if content_val is not None:
+        result["content"] = content_val
+
+    return result
 
 
 def run_agent(task: str) -> None:

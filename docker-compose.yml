@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Solo-Coder: agent + isolated code-execution sandbox
 #
 # Services:
